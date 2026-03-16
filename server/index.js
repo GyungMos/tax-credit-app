@@ -128,7 +128,10 @@ loadActivity();
 function getAvailableYears() {
     try {
         const items = fs.readdirSync(WATCH_DIR);
-        const years = items.filter(i => /^\d{4}$/.test(i)).map(i => parseInt(i));
+        let years = items.filter(i => /^\d{4}$/.test(i)).map(i => parseInt(i));
+        // Always include 2022~2026 as a baseline
+        const baseline = [2022, 2023, 2024, 2025, 2026];
+        years = [...years, ...baseline];
         const currentYear = new Date().getFullYear();
         if (!years.includes(currentYear)) years.push(currentYear);
         return Array.from(new Set(years)).sort((a,b) => b - a);
@@ -285,7 +288,13 @@ function processFile(filePath) {
 
 async function updateAllData() {
     try {
-        loadMapping(); SUPPORTED_YEARS = getAvailableYears();
+        loadMapping(); 
+        SUPPORTED_YEARS = getAvailableYears();
+        // Ensure baseline folders exist
+        SUPPORTED_YEARS.forEach(yr => {
+            const yrDir = path.join(WATCH_DIR, yr.toString());
+            if (!fs.existsSync(yrDir)) fs.mkdirSync(yrDir, { recursive: true });
+        });
         const allProcessed = {}, branchFiles = {}, scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
         for (const dir of scanDirs) {
             if (!fs.existsSync(dir)) continue;
