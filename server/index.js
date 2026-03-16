@@ -532,9 +532,11 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     
     console.log(`API Upload Hit - Year: ${year}, Branch: ${branch}`);
 
-    if (!year || !branch) {
-        return res.status(400).json({ error: 'Year and Branch are required in query or body' });
+    if (!year) {
+        return res.status(400).json({ error: 'Year is required in query or body' });
     }
+    // If branch is 'auto' or undefined, we skip the match check but still process.
+    const isAuto = !branch || branch === 'auto' || branch === 'undefined';
 
     try {
         // Basic validation: Check if '부서' in Excel matches 'branch'
@@ -549,7 +551,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
             // Same normalization as in processFile
             dept = dept.replace(/^\d{4}/, '').replace(/.*평우서비스/, '').trim();
             deptsInFile.add(dept);
-            if (dept === branch) matchFound = true;
+            if (isAuto || dept === branch) matchFound = true;
         });
 
         updateAllData();

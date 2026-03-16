@@ -209,17 +209,19 @@ const App = () => {
   };
 
   const handleTargetedUpload = async (file) => {
-    if (!selectedBranch && !selectedCorp) {
+    const isSystemEmpty = !data.corporations || Object.keys(data.corporations).length === 0;
+    if (!selectedBranch && !selectedCorp && !isSystemEmpty) {
         alert('먼저 지점을 선택해주세요.');
         return;
     }
-    const targetBranch = selectedBranch || selectedCorp;
     setLoading(true);
     const formData = new FormData();
-    formData.append('year', year);
-    formData.append('branch', targetBranch);
     formData.append('file', file);
-
+    formData.append('year', year);
+    if (selectedBranch) formData.append('branch', selectedBranch);
+    else if (selectedCorp) formData.append('branch', selectedCorp);
+    else formData.append('branch', 'auto');
+    const targetBranch = selectedBranch || selectedCorp || 'auto';
     try {
       const res = await fetch(`/api/upload?year=${year}&branch=${encodeURIComponent(targetBranch)}`, {
         method: 'POST',
@@ -916,8 +918,8 @@ const App = () => {
                 className="btn-upload" 
                 style={{ 
                   margin: 0, 
-                  opacity: (selectedBranch || selectedCorp) ? 1 : 0.5,
-                  cursor: (selectedBranch || selectedCorp) ? 'pointer' : 'not-allowed'
+                  opacity: (selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0)) ? 1 : 0.5,
+                  cursor: (selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0)) ? 'pointer' : 'not-allowed'
                 }}
               >
                 <Upload size={18} /> 자료 업로드
@@ -925,7 +927,7 @@ const App = () => {
                   type="file" 
                   accept=".xlsx" 
                   style={{ display: 'none' }} 
-                  disabled={!(selectedBranch || selectedCorp)}
+                  disabled={!(selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0))}
                   onChange={(e) => {
                     const file = e.target.files[0];
                     if (file) handleTargetedUpload(file);
