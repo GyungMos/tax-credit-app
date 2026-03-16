@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Download, FileText, ArrowUpRight, ArrowDownRight, Upload, FileSpreadsheet, ArrowUp, ArrowDown, Moon, Sun, Edit2, Trash2, RotateCcw, AlertCircle, AlertTriangle } from 'lucide-react';
+import { RefreshCw, Download, FileText, ArrowUpRight, ArrowDownRight, Upload, FileSpreadsheet, ArrowUp, ArrowDown, Moon, Sun, Edit2, Trash2, RotateCcw, AlertCircle, AlertTriangle, Plus } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
@@ -538,19 +538,60 @@ const App = () => {
   };
 
   const handleRefresh = async () => {
-    if (!confirm('모든 데이터를 초기화하고 저장된 파일을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) {
+    let msg = '모든 데이터를 초기화하고 저장된 파일을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.';
+    let body = {};
+    
+    if (selectedBranch) {
+      msg = `[${year}년 ${selectedBranch}] 자료만 초기화하시겠습니까?\n이 지점의 해당 연도 데이터만 삭제됩니다.`;
+      body = { year, branch: selectedBranch };
+    }
+
+    if (!confirm(msg)) {
       return;
     }
     setLoading(true);
     try {
-      await fetch('/api/refresh', { method: 'POST' });
+      await fetch('/api/refresh', { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
       await fetchData();
-      alert('데이터가 초기화되었습니다.');
+      alert(selectedBranch ? `${selectedBranch}의 ${year}년 데이터가 초기화되었습니다.` : '모든 데이터가 초기화되었습니다.');
     } catch (e) {
       console.error(e);
       alert('초기화 중 오류가 발생했습니다.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const addNewYear = async () => {
+    const newY = prompt('추가할 연도(숫자 4자리)를 입력하세요:', new Date().getFullYear() + 1);
+    if (newY && !isNaN(newY) && newY.length === 4) {
+      setLoading(true);
+      try {
+        const res = await fetch('/api/add-year', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ year: parseInt(newY) })
+        });
+        if (res.ok) {
+          const result = await res.json();
+          setData(prev => ({ ...result.data }));
+          setYear(parseInt(newY));
+          alert(`${newY}년이 추가되었습니다.`);
+        } else {
+          alert('연도 추가에 실패했습니다.');
+        }
+      } catch (e) {
+        console.error(e);
+        alert('오류가 발생했습니다.');
+      } finally {
+        setLoading(false);
+      }
+    } else if (newY) {
+      alert('올바른 연도 형식이 아닙니다. (예: 2027)');
     }
   };
 
@@ -910,9 +951,27 @@ const App = () => {
             >
               {theme === 'dark-theme' ? <Sun size={18} /> : <Moon size={18} />}
             </button>
-            <select value={year} onChange={(e) => setYear(parseInt(e.target.value))}>
-              {(data.years || [2026, 2025, 2024, 2023, 2022]).map(y => <option key={y} value={y}>{y}년</option>)}
-            </select>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+              <select value={year} onChange={(e) => setYear(parseInt(e.target.value))}>
+                {(data.years || [2026, 2025, 2024, 2023, 2022]).map(y => <option key={y} value={y}>{y}년</option>)}
+              </select>
+              <button 
+                onClick={addNewYear} 
+                style={{ 
+                  padding: '0.4rem', 
+                  borderRadius: '0.5rem', 
+                  background: 'var(--glass)', 
+                  color: 'var(--text)', 
+                  border: '1px solid var(--border)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+                title="연도 추가"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
             <div style={{ display: 'flex', alignItems: 'center', background: 'var(--glass)', borderRadius: '0.75rem', border: '1px solid var(--border)', padding: '2px' }}>
               <label 
                 className="btn-upload" 

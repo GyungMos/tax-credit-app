@@ -222,8 +222,8 @@ function processFile(filePath) {
         });
         const uniqueEmployeesMap = new Map();
         rawData.forEach(emp => {
-            const name = (emp.사원명 || '').toString().trim(), rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim(), key = `${name}|${rrn}`;
-            if (key !== '|' && !uniqueEmployeesMap.has(key)) uniqueEmployeesMap.set(key, emp);
+            const name = (emp.사원명 || '').toString().trim(), rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim(), joinDate = (emp.입사일자 || '').toString().trim(), key = `${name}|${rrn}|${joinDate}`;
+            if (key !== '||' && !uniqueEmployeesMap.has(key)) uniqueEmployeesMap.set(key, emp);
         });
         const data = Array.from(uniqueEmployeesMap.values()), years = [2022, 2023, 2024, 2025, 2026];
         const branchDataMap = {};
@@ -375,23 +375,42 @@ app.get('/api/data', async (req, res) => {
 
 app.post('/api/refresh', async (req, res) => {
     try {
+        const { year, branch } = req.body;
         const backupRoot = path.join(WATCH_DIR, '_초기화_백업'); if (!fs.existsSync(backupRoot)) fs.mkdirSync(backupRoot, { recursive: true });
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0], backupDir = path.join(backupRoot, timestamp); fs.mkdirSync(backupDir, { recursive: true });
-        const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))]; let movedCount = 0;
-        for (const dir of scanDirs) {
-            if (!fs.existsSync(dir)) continue;
-            const files = fs.readdirSync(dir).filter(f => f.includes('사원등록') && f.endsWith('.xlsx'));
-            for (const f of files) {
-                const oldPath = path.join(dir, f), dirName = path.basename(dir), newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${f}` : f, newPath = path.join(backupDir, newName);
+        
+        if (year && branch) {
+            // Contextual reset: Only one file
+            const dir = path.join(WATCH_DIR, year.toString());
+            const fileName = `${branch}_사원등록.xlsx`;
+            const oldPath = path.join(dir, fileName);
+            if (fs.existsSync(oldPath)) {
+                const newName = `${year}_${fileName}`;
+                const newPath = path.join(backupDir, newName);
                 fs.renameSync(oldPath, newPath);
-                await syncToDB(newPath); await syncToDB(oldPath, true);
-                movedCount++;
+                await syncToDB(newPath);
+                await syncToDB(oldPath, true);
+                console.log(`[SERVER] Contextual reset: ${year} ${branch}`);
+                await logActivity('CLEAR', `[${branch}] ${year}년 데이터 초기화`);
             }
+        } else {
+            // Full reset: Original logic
+            const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
+            for (const dir of scanDirs) {
+                if (!fs.existsSync(dir)) continue;
+                const files = fs.readdirSync(dir).filter(f => f.includes('사원등록') && f.endsWith('.xlsx'));
+                for (const f of files) {
+                    const oldPath = path.join(dir, f), dirName = path.basename(dir), newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${f}` : f, newPath = path.join(backupDir, newName);
+                    fs.renameSync(oldPath, newPath);
+                    await syncToDB(newPath); await syncToDB(oldPath, true);
+                }
+            }
+            console.log('[SERVER] Full Refresh complete.');
+            await logActivity('RESET', '전체 데이터 초기화');
         }
         await updateAllData(); 
-        console.log('[SERVER] Refresh complete.');
         res.json({ success: true, message: 'Data archived', data: processedResults });
-    } catch (e) { 
+    } catch (e) {
         console.error('[SERVER] Refresh error:', e);
         res.status(500).json({ error: 'Reset failed' }); 
     }
@@ -474,6 +493,24 @@ app.post('/api/clear-branch-data', async (req, res) => {
     } catch (e) { 
         console.error('[SERVER] Clear error:', e);
         res.status(500).json({ error: 'Clear failed' }); 
+    }
+});
+
+app.post('/api/add-year', async (req, res) => {
+    const { year } = req.body;
+    if (!year || isNaN(year)) return res.status(400).json({ error: 'Invalid year' });
+    try {
+        const yrDir = path.join(WATCH_DIR, year.toString());
+        if (!fs.existsSync(yrDir)) {
+            fs.mkdirSync(yrDir, { recursive: true });
+            console.log(`[SERVER] Created new year folder: ${year}`);
+            await logActivity('CONFIG', `${year}년 연도 추가`);
+        }
+        await updateAllData();
+        res.json({ success: true, data: processedResults });
+    } catch (e) {
+        console.error('[SERVER] Add year error:', e);
+        res.status(500).json({ error: 'Failed to add year' });
     }
 });
 
