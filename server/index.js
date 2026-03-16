@@ -437,9 +437,15 @@ app.post('/api/delete-branch', async (req, res) => {
             if (fs.existsSync(branchFile)) { const newName = `${path.basename(dir)}_${branchName}_사원등록.xlsx`, archPath = path.join(backupDir, newName); fs.renameSync(branchFile, archPath); await syncToDB(archPath); await syncToDB(branchFile, true); }
         }
         loadMapping(); mapping.corporations.forEach(corp => { if (corp.branchNames) corp.branchNames = corp.branchNames.filter(bn => bn !== branchName); });
-        await saveMapping(); updateAllData(); await logActivity('DELETE', `지점 삭제: ${branchName}`);
+        await saveMapping(); 
+        await updateAllData(); 
+        await logActivity('DELETE', `지점 삭제: ${branchName}`);
+        console.log(`[SERVER] Delete success: ${branchName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) { res.status(500).json({ error: 'Delete failed' }); }
+    } catch (e) { 
+        console.error('[SERVER] Delete error:', e);
+        res.status(500).json({ error: 'Delete failed' }); 
+    }
 });
 
 app.post('/api/clear-branch-data', async (req, res) => {
@@ -452,13 +458,24 @@ app.post('/api/clear-branch-data', async (req, res) => {
             const branchFile = path.join(dir, `${branchName}_사원등록.xlsx`);
             if (fs.existsSync(branchFile)) { const archPath = path.join(backupDir, `${path.basename(dir)}_${branchName}_xlsx`); fs.renameSync(branchFile, archPath); await syncToDB(archPath); await syncToDB(branchFile, true); }
         }
-        updateAllData(); await logActivity('CLEAR', `지점 비우기: ${branchName}`);
+        await updateAllData(); 
+        await logActivity('CLEAR', `지점 비우기: ${branchName}`);
+        console.log(`[SERVER] Clear success: ${branchName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) { res.status(500).json({ error: 'Clear failed' }); }
+    } catch (e) { 
+        console.error('[SERVER] Clear error:', e);
+        res.status(500).json({ error: 'Clear failed' }); 
+    }
 });
 
 app.get('/api/mapping', (req, res) => { loadMapping(); res.json(mapping); });
-app.post('/api/mapping', async (req, res) => { mapping = req.body; await saveMapping(); updateAllData(); res.json({ success: true, data: processedResults }); });
+app.post('/api/mapping', async (req, res) => { 
+    console.log('[SERVER] POST /api/mapping');
+    mapping = req.body; 
+    await saveMapping(); 
+    await updateAllData(); 
+    res.json({ success: true, data: processedResults }); 
+});
 
 const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(clientBuildPath)) {
@@ -466,9 +483,9 @@ if (fs.existsSync(clientBuildPath)) {
     app.get('*', (req, res) => res.sendFile(path.join(clientBuildPath, 'index.html')));
 }
 
-const server = app.listen(process.env.PORT || PORT, () => {
+const server = app.listen(process.env.PORT || PORT, async () => {
     console.log(`Server running on port ${process.env.PORT || PORT}`);
-    updateAllData();
+    await updateAllData();
 });
 server.on('error', (err) => console.error('SERVER ERROR:', err));
 setInterval(() => {}, 10000);
