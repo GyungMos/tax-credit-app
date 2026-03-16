@@ -254,6 +254,15 @@ function processFile(filePath) {
                 const sumT = monthly.reduce((s, h) => s + h.total, 0), sumY = monthly.reduce((s, h) => s + h.youth, 0);
                 const avgT = parseFloat((sumT / 12).toFixed(2)), avgY = parseFloat((sumY / 12).toFixed(2));
                 const details = deptData.filter(emp => emp.입사일자 <= `${year}1231` && (emp.퇴사일자 || '99991231') >= `${year}0101`).map(emp => {
+                    let monthsActiveCount = 0, startM = null, endM = null;
+                    for (let m = 1; m <= 12; m++) {
+                        const lDay = new Date(year, m, 0).toISOString().split('T')[0].replace(/-/g, '');
+                        if (emp.입사일자 <= lDay && (emp.퇴사일자 || '99991231') >= lDay) {
+                            monthsActiveCount++;
+                            if (startM === null) startM = m;
+                            endM = m;
+                        }
+                    }
                     const birth = getBirthDate(emp['주민(외국인)등록번호']), ageAtJoin = calculateAgeAtJoin(birth, emp.입사일자.toString()), isYouthAtJoin = (ageAtJoin >= 15 && ageAtJoin <= 34);
                     let exclusionDate = ''; if (isYouthAtJoin && birth) exclusionDate = `${parseInt(birth.substring(0, 4)) + 35}-${birth.substring(4, 6)}-${birth.substring(6, 8)}`;
                     const address = emp.주소 || emp.근무지 || emp.사업장 || '', isMetro = address.includes('서울') || address.includes('경기');
@@ -263,7 +272,8 @@ function processFile(filePath) {
                         col15: emp.사원명 || '', col16: 'Y', col17: '', col18: emp.단시간유형 || emp.가중치 || '1.0',
                         col19: (emp.내외국인구분 || '').includes('내국인') ? 'Y' : 'N', col20: isMetro ? 'Y' : 'N',
                         col21: emp.입사일자 ? `${emp.입사일자.toString().substring(0, 4)}-${emp.입사일자.toString().substring(4, 6)}-${emp.입사일자.toString().substring(6, 8)}` : '',
-                        col23: 12, col24: isYouthAtJoin ? 12 : 0, col25: isYouthAtJoin ? 'Y' : 'N', col26: isYouthAtJoin ? 'Y' : 'N', col27: exclusionDate, col28: emp.장애인 > 0 ? 'Y' : 'N', col29: (emp.나이 || 0) >= 60 ? 'Y' : 'N', col30: (emp.경력단절 || 0) > 0 ? 'Y' : 'N', col31: (emp.북약 || 0) > 0 ? 'Y' : 'N', col32: 'N', col33: 'N', col34: '', col35: '', _retiredThisYear: retiredThisYear
+                        col22: startM ? `${startM.toString().padStart(2, '0')}~${endM.toString().padStart(2, '0')}` : '',
+                        col23: monthsActiveCount, col24: isYouthAtJoin ? monthsActiveCount : 0, col25: isYouthAtJoin ? 'Y' : 'N', col26: isYouthAtJoin ? 'Y' : 'N', col27: exclusionDate, col28: emp.장애인 > 0 ? 'Y' : 'N', col29: (emp.나이 || 0) >= 60 ? 'Y' : 'N', col30: (emp.경력단절 || 0) > 0 ? 'Y' : 'N', col31: (emp.북약 || 0) > 0 ? 'Y' : 'N', col32: 'N', col33: 'N', col34: '', col35: '', _retiredThisYear: retiredThisYear
                     };
                 });
                 branchDataMap[deptName].years[year] = { monthly, avgTotal: avgT, avgYouth: avgY, avgOther: parseFloat((avgT - avgY).toFixed(2)), sumTotal: parseFloat(sumT.toFixed(2)), sumYouth: parseFloat(sumY.toFixed(2)), summary: { col1: sumT.toFixed(2), col2: '12', col3: avgT.toFixed(2), col5: sumY.toFixed(2), col6: '0', col7: '0', col8: '0', col9: '0', col10: sumY.toFixed(2), col11: '12', col12: avgY.toFixed(2), col13: (avgT - avgY).toFixed(2) }, details };
@@ -346,7 +356,13 @@ try {
     });
 } catch (e) {}
 
-app.get('/api/data', (req, res) => res.json(processedResults));
+app.get('/api/data', async (req, res) => {
+    console.log('[SERVER] GET /api/data');
+    if (!processedResults || Object.keys(processedResults.corporations || {}).length === 0) {
+        await updateAllData();
+    }
+    res.json(processedResults);
+});
 
 app.post('/api/refresh', async (req, res) => {
     try {
@@ -363,17 +379,30 @@ app.post('/api/refresh', async (req, res) => {
                 movedCount++;
             }
         }
-        updateAllData(); res.json({ success: true, message: 'Data archived', data: processedResults });
-    } catch (e) { res.status(500).json({ error: 'Reset failed' }); }
+        await updateAllData(); 
+        console.log('[SERVER] Refresh complete.');
+        res.json({ success: true, message: 'Data archived', data: processedResults });
+    } catch (e) { 
+        console.error('[SERVER] Refresh error:', e);
+        res.status(500).json({ error: 'Reset failed' }); 
+    }
 });
 
 app.post('/api/upload', upload.single('file'), async (req, res) => {
-    const { year, branch } = req.query; const isAuto = !branch || branch === 'auto' || branch === 'undefined';
+    const { year, branch } = req.query; 
+    console.log(`[SERVER] Upload started: year=${year}, branch=${branch}, file=${req.file?.originalname}`);
     try {
-        const finalPath = req.file.path; await syncToDB(finalPath); updateAllData();
+        const finalPath = req.file.path; 
+        await syncToDB(finalPath); 
+        console.log('[SERVER] DB sync complete, updating data...');
+        await updateAllData(); 
         await logActivity('UPLOAD', `[${branch}] ${year}년 업로드: ${decodeText(req.file.originalname)}`);
+        console.log('[SERVER] Upload process finished successfully.');
         res.json({ success: true, data: processedResults });
-    } catch (e) { res.status(500).json({ error: 'Upload failed' }); }
+    } catch (e) { 
+        console.error('[SERVER] Upload error:', e);
+        res.status(500).json({ error: 'Upload failed' }); 
+    }
 });
 
 app.post('/api/rename-branch', async (req, res) => {
@@ -386,9 +415,15 @@ app.post('/api/rename-branch', async (req, res) => {
             if (fs.existsSync(oldFile)) { fs.renameSync(oldFile, newFile); await syncToDB(newFile); await syncToDB(oldFile, true); }
         }
         loadMapping(); mapping.corporations.forEach(corp => { if (corp.branchNames) { const idx = corp.branchNames.indexOf(oldName); if (idx !== -1) corp.branchNames[idx] = newName; } });
-        await saveMapping(); updateAllData(); await logActivity('RENAME', `${oldName} -> ${newName}`);
+        await saveMapping(); 
+        await updateAllData(); 
+        await logActivity('RENAME', `${oldName} -> ${newName}`);
+        console.log(`[SERVER] Rename success: ${oldName} -> ${newName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) { res.status(500).json({ error: 'Rename failed' }); }
+    } catch (e) { 
+        console.error('[SERVER] Rename error:', e);
+        res.status(500).json({ error: 'Rename failed' }); 
+    }
 });
 
 app.post('/api/delete-branch', async (req, res) => {
