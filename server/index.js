@@ -5,16 +5,95 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const chokidar = require('chokidar');
+const mongoose = require('mongoose');
 
 const app = express();
 const PORT = process.env.PORT || 5010;
 const WATCH_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!fs.existsSync(WATCH_DIR)) {
     fs.mkdirSync(WATCH_DIR, { recursive: true });
 }
 
-// Helper to fix garbled Korean text from multer/busboy (Windows/Latin1 issues)
+// --- MongoDB Setup ---
+const FileSchema = new mongoose.Schema({
+    originalName: String,
+    path: String, // Relative to WATCH_DIR
+    data: Buffer,
+    year: Number,
+    lastModified: Number
+});
+
+const ConfigSchema = new mongoose.Schema({
+    key: { type: String, unique: true },
+    content: Object
+});
+
+const FileModel = mongoose.model('File', FileSchema);
+const ConfigModel = mongoose.model('Config', ConfigSchema);
+
+async function syncToDB(filePath, isDelete = false) {
+    if (!MONGODB_URI) return;
+    try {
+        const relativePath = path.relative(WATCH_DIR, filePath).replace(/\\/g, '/');
+        if (isDelete) {
+            await FileModel.deleteOne({ path: relativePath });
+            console.log(`DB: Deleted ${relativePath}`);
+        } else if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+            const stats = fs.statSync(filePath);
+            const content = fs.readFileSync(filePath);
+            await FileModel.findOneAndUpdate(
+                { path: relativePath },
+                { 
+                    originalName: path.basename(filePath),
+                    data: content,
+                    lastModified: stats.mtimeMs
+                },
+                { upsert: true }
+            );
+            console.log(`DB: Saved ${relativePath}`);
+        }
+    } catch (e) {
+        console.error('DB Sync Error:', e);
+    }
+}
+
+async function restoreFromDB() {
+    if (!MONGODB_URI) return;
+    console.log('Restoring data from MongoDB...');
+    try {
+        const configs = await ConfigModel.find();
+        for (const cfg of configs) {
+            const fileName = cfg.key === 'mapping' ? 'mapping.json' : 'activity.json';
+            const filePath = path.join(WATCH_DIR, fileName);
+            fs.writeFileSync(filePath, JSON.stringify(cfg.content, null, 2));
+            console.log(`Restored Config: ${fileName}`);
+        }
+
+        const files = await FileModel.find();
+        for (const file of files) {
+            const targetPath = path.join(WATCH_DIR, file.path);
+            const targetDir = path.dirname(targetPath);
+            if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+            fs.writeFileSync(targetPath, file.data);
+            console.log(`Restored File: ${file.path}`);
+        }
+        console.log('Database restoration complete.');
+    } catch (e) {
+        console.error('DB Restore Error:', e);
+    }
+}
+
+if (MONGODB_URI) {
+    mongoose.connect(MONGODB_URI)
+        .then(() => {
+            console.log('Connected to MongoDB Atlas');
+            restoreFromDB().then(() => updateAllData());
+        })
+        .catch(err => console.error('MongoDB Connection Error:', err));
+}
+
 function decodeText(text) {
     if (!text) return text;
     try {
@@ -36,10 +115,13 @@ function loadActivity() {
         try { recentActivities = JSON.parse(fs.readFileSync(ACTIVITY_FILE, 'utf8')); } catch (e) { recentActivities = []; }
     }
 }
-function logActivity(type, msg) {
+async function logActivity(type, msg) {
     recentActivities.unshift({ type, msg, timestamp: new Date().toISOString() });
     recentActivities = recentActivities.slice(0, 50);
-    try { fs.writeFileSync(ACTIVITY_FILE, JSON.stringify(recentActivities, null, 2)); } catch (e) {}
+    try { 
+        fs.writeFileSync(ACTIVITY_FILE, JSON.stringify(recentActivities, null, 2)); 
+        if (MONGODB_URI) await ConfigModel.findOneAndUpdate({ key: 'activity' }, { content: recentActivities }, { upsert: true });
+    } catch (e) {}
 }
 loadActivity();
 
@@ -63,17 +145,15 @@ SUPPORTED_YEARS.forEach(yr => {
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        // Use query params for immediate availability during stream processing
         const year = req.query.year || new Date().getFullYear().toString();
         const dest = path.join(WATCH_DIR, year.toString());
         if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
         cb(null, dest);
     },
     filename: (req, file, cb) => {
-        const branch = req.query.branch; // Query params are already decoded usually
+        const branch = req.query.branch;
         const originalName = decodeText(file.originalname);
-        console.log(`Upload Storage - Branch: [${branch}], Year: [${req.query.year}], File: [${originalName}]`);
-        if (branch) {
+        if (branch && branch !== 'auto' && branch !== 'undefined') {
             cb(null, `${branch}_사원등록.xlsx`);
         } else {
             cb(null, originalName);
@@ -82,142 +162,81 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-let mapping = {
-    corporations: [] // [ { id, name, branchNames: [] } ]
-};
-
+let mapping = { corporations: [] };
 function loadMapping() {
     if (fs.existsSync(MAPPING_FILE)) {
         try {
             const raw = fs.readFileSync(MAPPING_FILE, 'utf8');
             const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-                mapping = { corporations: parsed };
-            } else if (parsed && parsed.corporations) {
-                mapping = parsed;
-            } else {
-                mapping = { corporations: [] };
-            }
-        } catch (e) {
-            console.error('Error parsing mapping.json:', e);
-            mapping = { corporations: [] };
-        }
-    } else {
-        mapping = { corporations: [] };
-    }
+            mapping = (Array.isArray(parsed)) ? { corporations: parsed } : (parsed.corporations ? parsed : { corporations: [] });
+        } catch (e) { mapping = { corporations: [] }; }
+    } else { mapping = { corporations: [] }; }
 }
 
-function saveMapping() {
-    fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2));
+async function saveMapping() {
+    try {
+        fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2));
+        if (MONGODB_URI) await ConfigModel.findOneAndUpdate({ key: 'mapping' }, { content: mapping }, { upsert: true });
+    } catch (e) { console.error('Save mapping failed:', e); }
 }
 
-let processedResults = {
-    updatedAt: new Date().toISOString(),
-    corporations: {},
-    unassigned: {} // { branchName: data }
-};
+let processedResults = { updatedAt: new Date().toISOString(), corporations: {}, unassigned: {} };
 
 function getBirthDate(rrn) {
     if (!rrn) return null;
     const s = rrn.toString().replace(/-/g, '');
     if (s.length < 7) return null;
-    const yy = s.substring(0, 2);
-    const mm = s.substring(2, 4);
-    const dd = s.substring(4, 6);
-    const gender = s.charAt(6);
-    let yearPrefix = '19';
-    if (gender === '3' || gender === '4' || gender === '7' || gender === '8') yearPrefix = '20';
+    const yy = s.substring(0, 2), mm = s.substring(2, 4), dd = s.substring(4, 6), gender = s.charAt(6);
+    let yearPrefix = (gender === '3' || gender === '4' || gender === '7' || gender === '8') ? '20' : '19';
     return `${yearPrefix}${yy}${mm}${dd}`;
 }
 
 function calculateAgeAtJoin(birth, joinDate) {
     if (!birth || !joinDate) return 0;
-    const bY = parseInt(birth.substring(0, 4));
-    const bM = parseInt(birth.substring(4, 6));
-    const bD = parseInt(birth.substring(6, 8));
-
-    const jStr = joinDate.toString();
-    const jY = parseInt(jStr.substring(0, 4));
-    const jM = parseInt(jStr.substring(4, 6));
-    const jD = parseInt(jStr.substring(6, 8));
-
+    const bY = parseInt(birth.substring(0, 4)), bM = parseInt(birth.substring(4, 6)), bD = parseInt(birth.substring(6, 8));
+    const jStr = joinDate.toString(), jY = parseInt(jStr.substring(0, 4)), jM = parseInt(jStr.substring(4, 6)), jD = parseInt(jStr.substring(6, 8));
     let age = jY - bY;
     if (jM < bM || (jM === bM && jD < bD)) age--;
     return age;
 }
 
 function parseBranchName(fileName) {
-    // Just extract the branch name part before _사원등록
     const match = fileName.match(/(.+)_사원등록/);
     return match ? match[1] : fileName.replace('.xlsx', '');
 }
 
 function processFile(filePath) {
-    // ... (logic remains largely same, just returns the object)
     try {
         const workbook = xlsx.readFile(filePath);
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const rawData = xlsx.utils.sheet_to_json(sheet);
-        
         const validation = [];
         rawData.forEach((emp, idx) => {
-            const rowNum = idx + 2; 
-            const name = (emp.사원명 || '').toString().trim();
-            const rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim();
-            const joinDate = (emp.입사일자 || '').toString().trim();
-            const retireDate = (emp.퇴사일자 || '').toString().trim();
-
+            const rowNum = idx + 2, name = (emp.사원명 || '').toString().trim(), rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim(), joinDate = (emp.입사일자 || '').toString().trim();
             if (!name) validation.push({ row: rowNum, type: 'error', field: '사원명', msg: '사원명이 누락되었습니다.' });
             if (!rrn) validation.push({ row: rowNum, type: 'error', field: '주민번호', msg: '주민번호가 누락되었습니다.' });
             if (!joinDate) validation.push({ row: rowNum, type: 'error', field: '입사일자', msg: '입사일자가 누락되었습니다.' });
-            
-            if (joinDate && retireDate && joinDate > retireDate) {
-                validation.push({ row: rowNum, type: 'warning', field: '입퇴사일', msg: `입사일(${joinDate})이 퇴사일(${retireDate})보다 늦습니다.` });
-            }
         });
-
-        // Deduplication: Use Name + SSN as key
         const uniqueEmployeesMap = new Map();
         rawData.forEach(emp => {
-            const name = (emp.사원명 || '').toString().trim();
-            const rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim();
-            const key = `${name}|${rrn}`;
-            if (key !== '|' && !uniqueEmployeesMap.has(key)) {
-                uniqueEmployeesMap.set(key, emp);
-            }
+            const name = (emp.사원명 || '').toString().trim(), rrn = (emp['주민(외국인)등록번호'] || '').toString().replace(/-/g, '').trim(), key = `${name}|${rrn}`;
+            if (key !== '|' && !uniqueEmployeesMap.has(key)) uniqueEmployeesMap.set(key, emp);
         });
-        const data = Array.from(uniqueEmployeesMap.values());
-        const years = [2022, 2023, 2024, 2025, 2026];
-        const fileResult = {
-            fileName: path.basename(filePath),
-            updatedAt: fs.statSync(filePath).mtime.toISOString(),
-            years: {}
-        };
-
-        const branchDataMap = {}; // departmentName -> { years: { yr: { data } } }
-
+        const data = Array.from(uniqueEmployeesMap.values()), years = [2022, 2023, 2024, 2025, 2026];
+        const branchDataMap = {};
         years.forEach(year => {
-            // Group raw data by department first
             const deptGroups = {};
             data.forEach(emp => {
                 let dept = (emp.부서 || '미지정').toString().trim();
                 const originalDept = dept;
-                // Simple and effective normalization:
-                // 1. Remove year: "2024 (주)평우서비스(본점)" -> " (주)평우서비스(본점)"
-                // 2. Remove corporate name: " (주)평우서비스(본점)" -> "(본점)"
                 dept = dept.replace(/^\d{4}/, '').replace(/.*평우서비스/, '').trim();
-                
                 if (!dept) dept = originalDept;
-                // console.log(`DEBUG: Normalized "${originalDept}" -> "${dept}"`);
-                
                 if (!deptGroups[dept]) deptGroups[dept] = [];
                 deptGroups[dept].push(emp);
             });
-
             Object.keys(deptGroups).forEach(deptName => {
                 const deptData = deptGroups[deptName];
                 if (!branchDataMap[deptName]) branchDataMap[deptName] = { branch: deptName, years: {} };
-
                 const monthly = [];
                 for (let m = 1; m <= 12; m++) {
                     const lastDay = new Date(year, m, 0).toISOString().split('T')[0].replace(/-/g, '');
@@ -226,508 +245,195 @@ function processFile(filePath) {
                         if (emp.입사일자 <= lastDay && (emp.퇴사일자 || '99991231') >= lastDay) {
                             const weight = parseFloat(emp.단시간유형 || emp.가중치 || 1.0);
                             tW += weight;
-                            const birth = getBirthDate(emp['주민(외국인)등록번호']);
-                            const age = calculateAgeAtJoin(birth, emp.입사일자.toString());
+                            const birth = getBirthDate(emp['주민(외국인)등록번호']), age = calculateAgeAtJoin(birth, emp.입사일자.toString());
                             if (age >= 15 && age <= 34) yW += weight;
                         }
                     });
                     monthly.push({ total: tW, youth: yW });
                 }
-
                 const sumT = monthly.reduce((s, h) => s + h.total, 0), sumY = monthly.reduce((s, h) => s + h.youth, 0);
                 const avgT = parseFloat((sumT / 12).toFixed(2)), avgY = parseFloat((sumY / 12).toFixed(2));
-                
                 const details = deptData.filter(emp => emp.입사일자 <= `${year}1231` && (emp.퇴사일자 || '99991231') >= `${year}0101`).map(emp => {
-                    let monthsActiveCount = 0, startM = null, endM = null;
-                    for (let m = 1; m <= 12; m++) {
-                        const lDay = new Date(year, m, 0).toISOString().split('T')[0].replace(/-/g, '');
-                        if (emp.입사일자 <= lDay && (emp.퇴사일자 || '99991231') >= lDay) {
-                            monthsActiveCount++;
-                            if (startM === null) startM = m;
-                            endM = m;
-                        }
-                    }
-                    const birth = getBirthDate(emp['주민(외국인)등록번호']);
-                    const ageAtJoin = calculateAgeAtJoin(birth, emp.입사일자.toString());
-                    const isYouthAtJoin = (ageAtJoin >= 15 && ageAtJoin <= 34);
-                    let exclusionDate = '';
-                    if (isYouthAtJoin && birth) {
-                        const bYear = parseInt(birth.substring(0, 4)) + 35;
-                        exclusionDate = `${bYear}-${birth.substring(4, 6)}-${birth.substring(6, 8)}`;
-                    }
-                    const address = emp.주소 || emp.근무지 || emp.사업장 || '';
-                    const isMetro = address.includes('서울') || address.includes('경기');
-                    
-                    // Retirement highlight logic: must be in the CURRENT processing year
-                    const retirementDate = emp.퇴사일자 ? emp.퇴사일자.toString().trim() : '';
-                    const retiredThisYear = !!(retirementDate && retirementDate.startsWith(year.toString()));
-                    
-                    if (emp.사원명 === '김명섭' && (year === 2024 || year === 2025)) {
-                        console.log(`DEBUG: Employee ${emp.사원명} (${year}) - Retired Date: [${retirementDate}], retiredThisYear: ${retiredThisYear}`);
-                    }
-
+                    const birth = getBirthDate(emp['주민(외국인)등록번호']), ageAtJoin = calculateAgeAtJoin(birth, emp.입사일자.toString()), isYouthAtJoin = (ageAtJoin >= 15 && ageAtJoin <= 34);
+                    let exclusionDate = ''; if (isYouthAtJoin && birth) exclusionDate = `${parseInt(birth.substring(0, 4)) + 35}-${birth.substring(4, 6)}-${birth.substring(6, 8)}`;
+                    const address = emp.주소 || emp.근무지 || emp.사업장 || '', isMetro = address.includes('서울') || address.includes('경기');
+                    const retiredThisYear = !!(emp.퇴사일자 && emp.퇴사일자.toString().startsWith(year.toString()));
                     return {
                         col14: birth ? `${birth.substring(0, 4)}-${birth.substring(4, 6)}-${birth.substring(6, 8)}` : '',
-                        col15: emp.사원명 || '', col16: 'Y', col17: '',
-                        col18: emp.단시간유형 || emp.가중치 || '1.0',
-                        col19: (emp.내외국인구분 || '').includes('내국인') ? 'Y' : 'N',
-                        col20: isMetro ? 'Y' : 'N',
+                        col15: emp.사원명 || '', col16: 'Y', col17: '', col18: emp.단시간유형 || emp.가중치 || '1.0',
+                        col19: (emp.내외국인구분 || '').includes('내국인') ? 'Y' : 'N', col20: isMetro ? 'Y' : 'N',
                         col21: emp.입사일자 ? `${emp.입사일자.toString().substring(0, 4)}-${emp.입사일자.toString().substring(4, 6)}-${emp.입사일자.toString().substring(6, 8)}` : '',
-                        col22: startM ? `${startM.toString().padStart(2, '0')}~${endM.toString().padStart(2, '0')}` : '',
-                        col23: monthsActiveCount, col24: isYouthAtJoin ? monthsActiveCount : 0,
-                        col25: isYouthAtJoin ? 'Y' : 'N', col26: isYouthAtJoin ? 'Y' : 'N',
-                        col27: exclusionDate, col28: emp.장애인 > 0 ? 'Y' : 'N',
-                        col29: (emp.나이 || 0) >= 60 ? 'Y' : 'N', col30: (emp.경력단절 || 0) > 0 ? 'Y' : 'N',
-                        col31: (emp.북약 || 0) > 0 ? 'Y' : 'N', col32: 'N', col33: 'N', col34: '', col35: '',
-                        _retiredThisYear: retiredThisYear
+                        col23: 12, col24: isYouthAtJoin ? 12 : 0, col25: isYouthAtJoin ? 'Y' : 'N', col26: isYouthAtJoin ? 'Y' : 'N', col27: exclusionDate, col28: emp.장애인 > 0 ? 'Y' : 'N', col29: (emp.나이 || 0) >= 60 ? 'Y' : 'N', col30: (emp.경력단절 || 0) > 0 ? 'Y' : 'N', col31: (emp.북약 || 0) > 0 ? 'Y' : 'N', col32: 'N', col33: 'N', col34: '', col35: '', _retiredThisYear: retiredThisYear
                     };
                 });
-
-                branchDataMap[deptName].years[year] = {
-                    monthly, avgTotal: avgT, avgYouth: avgY,
-                    avgOther: parseFloat((avgT - avgY).toFixed(2)),
-                    sumTotal: parseFloat(sumT.toFixed(2)), sumYouth: parseFloat(sumY.toFixed(2)),
-                    summary: {
-                        col1: sumT.toFixed(2), col2: '12', col3: avgT.toFixed(2),
-                        col5: sumY.toFixed(2), col6: '0', col7: '0', col8: '0', col9: '0', col10: sumY.toFixed(2),
-                        col11: '12', col12: avgY.toFixed(2), col13: (avgT - avgY).toFixed(2)
-                    },
-                    details
-                };
+                branchDataMap[deptName].years[year] = { monthly, avgTotal: avgT, avgYouth: avgY, avgOther: parseFloat((avgT - avgY).toFixed(2)), sumTotal: parseFloat(sumT.toFixed(2)), sumYouth: parseFloat(sumY.toFixed(2)), summary: { col1: sumT.toFixed(2), col2: '12', col3: avgT.toFixed(2), col5: sumY.toFixed(2), col6: '0', col7: '0', col8: '0', col9: '0', col10: sumY.toFixed(2), col11: '12', col12: avgY.toFixed(2), col13: (avgT - avgY).toFixed(2) }, details };
             });
         });
-        return { branchDataMap, validation }; // Returns data and validation results
-    } catch (e) {
-        console.error(`Error processing file ${filePath}:`, e);
-        return null;
-    }
+        return { branchDataMap, validation };
+    } catch (e) { console.error(`Error processing file ${filePath}:`, e); return null; }
 }
 
 async function updateAllData() {
-    console.log(`[${new Date().toISOString()}] Data update triggered...`);
     try {
-        loadMapping();
-        SUPPORTED_YEARS = getAvailableYears();
-        console.log(`Supported Years: ${SUPPORTED_YEARS}`);
-        
-        // Scan all year-specific folders
-        const allProcessed = {};
-        const branchFiles = {}; // branchName -> { year -> { fullPath, mtime } }
-
-    // Scan both root and yearly folders
-    const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
-    
-    scanDirs.forEach(dir => {
-        if (!fs.existsSync(dir)) return;
-        const dirYear = dir === WATCH_DIR ? null : parseInt(path.basename(dir));
-        
-        fs.readdirSync(dir)
-            .filter(f => f.includes('사원등록') && f.endsWith('.xlsx'))
-            .forEach(f => {
-                const fullPath = path.join(dir, f);
-                const stats = fs.statSync(fullPath);
-                
-                // Determine year: from folder name or filename prefix
-                let yr = dirYear;
-                if (!yr) {
-                    const match = f.match(/^(\d{4})/);
-                    if (match) yr = parseInt(match[1]);
-                }
-                
+        loadMapping(); SUPPORTED_YEARS = getAvailableYears();
+        const allProcessed = {}, branchFiles = {}, scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
+        for (const dir of scanDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const dirYear = dir === WATCH_DIR ? null : parseInt(path.basename(dir));
+            const files = fs.readdirSync(dir).filter(f => f.includes('사원등록') && f.endsWith('.xlsx'));
+            for (const f of files) {
+                const fullPath = path.join(dir, f), stats = fs.statSync(fullPath);
+                let yr = dirYear; if (!yr) { const match = f.match(/^(\d{4})/); if (match) yr = parseInt(match[1]); }
                 if (yr && SUPPORTED_YEARS.includes(yr)) {
                     const branch = parseBranchName(f);
                     if (!branchFiles[branch]) branchFiles[branch] = {};
-                    if (!branchFiles[branch][yr] || branchFiles[branch][yr].mtime < stats.mtime.getTime()) {
-                        branchFiles[branch][yr] = { name: f, fullPath, branch, mtime: stats.mtime.getTime(), year: yr };
-                    }
-                }
-            });
-    });
-
-    const validationReports = {};
-    // Process each branch by merging its yearly data
-    Object.keys(branchFiles).forEach(branchKey => {
-        const yearsData = branchFiles[branchKey];
-        
-        Object.keys(yearsData).forEach(yr => {
-            const result = processFile(yearsData[yr].fullPath);
-            if (result) {
-                const { branchDataMap, validation } = result;
-                if (validation && validation.length > 0) {
-                    const fileName = yearsData[yr].name;
-                    if (!validationReports[fileName]) validationReports[fileName] = [];
-                    validationReports[fileName].push(...validation);
-                }
-                if (branchDataMap) {
-                    Object.keys(branchDataMap).forEach(deptName => {
-                        const deptResult = branchDataMap[deptName];
-                        if (!allProcessed[deptName]) {
-                            allProcessed[deptName] = {
-                                branch: deptName,
-                                updatedAt: new Date().toISOString(),
-                                years: {}
-                            };
-                            [2022, 2023, 2024, 2025, 2026].forEach(y => {
-                                allProcessed[deptName].years[y] = { monthly: Array(12).fill({total:0, youth:0}), avgTotal:0, avgYouth:0, avgOther:0, sumTotal:0, sumYouth:0, summary:{}, details:[] };
-                            });
-                        }
-                        if (deptResult.years[yr]) {
-                            allProcessed[deptName].years[yr] = deptResult.years[yr];
-                        }
-                    });
+                    if (!branchFiles[branch][yr] || branchFiles[branch][yr].mtime < stats.mtime.getTime()) branchFiles[branch][yr] = { name: f, fullPath, branch, mtime: stats.mtime.getTime(), year: yr };
                 }
             }
-        });
-    });
-
-    // Grouping by mapping
-    const newCorpData = {};
-    const assignedBranches = new Set();
-
-    const normalizeForMatch = (name) => {
-        return name.replace(/^\d{4}/, '').replace(/.*평우서비스/, '').trim();
-    };
-
-    mapping.corporations.forEach(corp => {
-        // Ensure every corporation exists in newCorpData, even if it has no branches
-        newCorpData[corp.name] = { branches: {}, total: null };
-        (corp.branchNames || []).forEach(bn => {
-            const normalizedBN = normalizeForMatch(bn);
-            if (allProcessed[normalizedBN]) {
-                newCorpData[corp.name].branches[normalizedBN] = allProcessed[normalizedBN];
-                assignedBranches.add(normalizedBN);
-            } else if (allProcessed[bn]) {
-                // Fallback to exact match if normalized didn't work
-                newCorpData[corp.name].branches[bn] = allProcessed[bn];
-                assignedBranches.add(bn);
-            }
-        });
-
-        const brs = Object.values(newCorpData[corp.name].branches);
-        if (brs.length > 0) {
-            const consolidated = { years: {} };
-            [2022, 2023, 2024, 2025, 2026].forEach(yr => {
-                let tAvgT = 0, tAvgY = 0, tSumT = 0, tSumY = 0;
-                const combMonthly = Array.from({ length: 12 }, () => ({ total: 0, youth: 0 }));
-                const combDetails = [];
-                brs.forEach(b => {
-                    const yD = b.years[yr];
-                    if (!yD) return;
-                    tAvgT += yD.avgTotal || 0; 
-                    tAvgY += yD.avgYouth || 0; 
-                    tSumT += yD.sumTotal || 0; 
-                    tSumY += yD.sumYouth || 0;
-                    if (yD.monthly) {
-                        yD.monthly.forEach((m, i) => { 
-                            if (combMonthly[i]) {
-                                combMonthly[i].total += m.total || 0; 
-                                combMonthly[i].youth += m.youth || 0; 
+        }
+        const validationReports = {};
+        for (const branchKey of Object.keys(branchFiles)) {
+            const yearsData = branchFiles[branchKey];
+            for (const yr of Object.keys(yearsData)) {
+                const result = processFile(yearsData[yr].fullPath);
+                if (result) {
+                    const { branchDataMap, validation } = result;
+                    if (validation && validation.length > 0) { const fileName = yearsData[yr].name; if (!validationReports[fileName]) validationReports[fileName] = []; validationReports[fileName].push(...validation); }
+                    if (branchDataMap) {
+                        Object.keys(branchDataMap).forEach(deptName => {
+                            const deptResult = branchDataMap[deptName];
+                            if (!allProcessed[deptName]) {
+                                allProcessed[deptName] = { branch: deptName, updatedAt: new Date().toISOString(), years: {} };
+                                [2022, 2023, 2024, 2025, 2026].forEach(y => { allProcessed[deptName].years[y] = { monthly: Array(12).fill({total:0, youth:0}), avgTotal:0, avgYouth:0, avgOther:0, sumTotal:0, sumYouth:0, summary:{}, details:[] }; });
                             }
+                            if (deptResult.years[yr]) allProcessed[deptName].years[yr] = deptResult.years[yr];
                         });
                     }
-                    if (yD.details) combDetails.push(...yD.details);
-                });
-                consolidated.years[yr] = {
-                    monthly: combMonthly, 
-                    avgTotal: parseFloat(tAvgT.toFixed(2)), 
-                    avgYouth: parseFloat(tAvgY.toFixed(2)),
-                    avgOther: parseFloat((tAvgT - tAvgY).toFixed(2)), 
-                    sumTotal: parseFloat(tSumT.toFixed(2)), 
-                    sumYouth: parseFloat(tSumY.toFixed(2)),
-                    summary: {
-                        col1: tSumT.toFixed(2), col2: '12', col3: tAvgT.toFixed(2), 
-                        col5: tSumY.toFixed(2), col6: '0', col7: '0', col8: '0', 
-                        col9: '0', col10: tSumY.toFixed(2), col11: '12', 
-                        col12: tAvgY.toFixed(2), col13: (tAvgT - tAvgY).toFixed(2)
-                    },
-                    details: combDetails
-                };
-            });
-            newCorpData[corp.name].total = consolidated;
+                }
+            }
         }
-    });
-
-    const unassigned = {};
-    Object.keys(allProcessed).forEach(bn => {
-        if (!assignedBranches.has(bn)) unassigned[bn] = allProcessed[bn];
-    });
-
-        processedResults = {
-            updatedAt: new Date().toISOString(),
-            corporations: newCorpData,
-            unassigned,
-            mapping: mapping.corporations,
-            validation: validationReports,
-            years: SUPPORTED_YEARS,
-            activities: recentActivities
-        };
-        console.log('Processed results updated with mapping.');
-    } catch (err) {
-        console.error('CRITICAL ERROR in updateAllData:', err);
-    }
+        const newCorpData = {}, assignedBranches = new Set(), normalizeForMatch = (name) => name.replace(/^\d{4}/, '').replace(/.*평우서비스/, '').trim();
+        mapping.corporations.forEach(corp => {
+            newCorpData[corp.name] = { branches: {}, total: null };
+            (corp.branchNames || []).forEach(bn => {
+                const normalizedBN = normalizeForMatch(bn);
+                if (allProcessed[normalizedBN]) { newCorpData[corp.name].branches[normalizedBN] = allProcessed[normalizedBN]; assignedBranches.add(normalizedBN); }
+                else if (allProcessed[bn]) { newCorpData[corp.name].branches[bn] = allProcessed[bn]; assignedBranches.add(bn); }
+            });
+            const brs = Object.values(newCorpData[corp.name].branches);
+            if (brs.length > 0) {
+                const consolidated = { years: {} };
+                [2022, 2023, 2024, 2025, 2026].forEach(yr => {
+                    let tAvgT = 0, tAvgY = 0, tSumT = 0, tSumY = 0; const combMonthly = Array.from({ length: 12 }, () => ({ total: 0, youth: 0 })), combDetails = [];
+                    brs.forEach(b => { const yD = b.years[yr]; if (!yD) return; tAvgT += yD.avgTotal || 0; tAvgY += yD.avgYouth || 0; tSumT += yD.sumTotal || 0; tSumY += yD.sumYouth || 0; if (yD.monthly) yD.monthly.forEach((m, i) => { if (combMonthly[i]) { combMonthly[i].total += m.total || 0; combMonthly[i].youth += m.youth || 0; } }); if (yD.details) combDetails.push(...yD.details); });
+                    consolidated.years[yr] = { monthly: combMonthly, avgTotal: parseFloat(tAvgT.toFixed(2)), avgYouth: parseFloat(tAvgY.toFixed(2)), avgOther: parseFloat((tAvgT - tAvgY).toFixed(2)), sumTotal: parseFloat(tSumT.toFixed(2)), sumYouth: parseFloat(tSumY.toFixed(2)), summary: { col1: tSumT.toFixed(2), col2: '12', col3: tAvgT.toFixed(2), col5: tSumY.toFixed(2), col6: '0', col7: '0', col8: '0', col9: '0', col10: tSumY.toFixed(2), col11: '12', col12: avgY.toFixed(2), col13: (tAvgT - tAvgY).toFixed(2) }, details: combDetails };
+                });
+                newCorpData[corp.name].total = consolidated;
+            }
+        });
+        const unassigned = {}; Object.keys(allProcessed).forEach(bn => { if (!assignedBranches.has(bn)) unassigned[bn] = allProcessed[bn]; });
+        processedResults = { updatedAt: new Date().toISOString(), corporations: newCorpData, unassigned, mapping: mapping.corporations, validation: validationReports, years: SUPPORTED_YEARS, activities: recentActivities };
+    } catch (err) { console.error('CRITICAL ERROR in updateAllData:', err); }
 }
 
-// File Watcher for auto-refresh
 try {
-    chokidar.watch(WATCH_DIR, { 
-        ignored: /(^|[\/\\])\..|node_modules|_초기화_백업/,
-        persistent: true,
-        ignoreInitial: true 
-    }).on('all', (event, filePath) => {
+    chokidar.watch(WATCH_DIR, { ignored: /(^|[\/\\])\..|node_modules|_초기화_백업/, persistent: true, ignoreInitial: true })
+    .on('all', (event, filePath) => {
         if (path.extname(filePath) === '.xlsx' && path.basename(filePath).includes('사원등록')) {
-            console.log(`Watcher: File change detected [${event}] on ${path.basename(filePath)}`);
+            console.log(`Watcher: ${event} on ${path.basename(filePath)}`);
             updateAllData();
         }
     });
-} catch (e) {
-    console.warn('Watcher could not be initialized (might be non-local or permission issue):', e.message);
-}
+} catch (e) {}
 
-app.get('/api/data', (req, res) => {
-    res.json(processedResults);
-});
+app.get('/api/data', (req, res) => res.json(processedResults));
 
-app.post('/api/refresh', (req, res) => {
+app.post('/api/refresh', async (req, res) => {
     try {
-        const backupRoot = path.join(WATCH_DIR, '_초기화_백업');
-        if (!fs.existsSync(backupRoot)) fs.mkdirSync(backupRoot, { recursive: true });
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0];
-        const backupDir = path.join(backupRoot, timestamp);
-        fs.mkdirSync(backupDir, { recursive: true });
-
-        const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
-        let movedCount = 0;
-
-        scanDirs.forEach(dir => {
-            if (fs.existsSync(dir)) {
-                const files = fs.readdirSync(dir);
-                files.forEach(f => {
-                    if (f.includes('사원등록') && f.endsWith('.xlsx')) {
-                        const oldPath = path.join(dir, f);
-                        // Add year prefix to backup filename if it's from a subfolder
-                        const dirName = path.basename(dir);
-                        const newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${f}` : f;
-                        const newPath = path.join(backupDir, newName);
-                        
-                        fs.renameSync(oldPath, newPath);
-                        movedCount++;
-                    }
-                });
+        const backupRoot = path.join(WATCH_DIR, '_초기화_백업'); if (!fs.existsSync(backupRoot)) fs.mkdirSync(backupRoot, { recursive: true });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0], backupDir = path.join(backupRoot, timestamp); fs.mkdirSync(backupDir, { recursive: true });
+        const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))]; let movedCount = 0;
+        for (const dir of scanDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const files = fs.readdirSync(dir).filter(f => f.includes('사원등록') && f.endsWith('.xlsx'));
+            for (const f of files) {
+                const oldPath = path.join(dir, f), dirName = path.basename(dir), newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${f}` : f, newPath = path.join(backupDir, newName);
+                fs.renameSync(oldPath, newPath);
+                await syncToDB(newPath); await syncToDB(oldPath, true);
+                movedCount++;
             }
-        });
-
-        console.log(`Reset triggered: ${movedCount} files moved to backup folder [${timestamp}].`);
-        updateAllData();
-        res.json({ success: true, message: 'Data initialized (Archived)', data: processedResults });
-    } catch (e) {
-        console.error('Reset failed:', e);
-        res.status(500).json({ error: 'Failed to reset data and backup files' });
-    }
+        }
+        updateAllData(); res.json({ success: true, message: 'Data archived', data: processedResults });
+    } catch (e) { res.status(500).json({ error: 'Reset failed' }); }
 });
 
-app.post('/api/upload', upload.single('file'), (req, res) => {
-    const year = req.query.year || req.body.year;
-    const branch = req.query.branch || req.body.branch;
-    
-    console.log(`API Upload Hit - Year: ${year}, Branch: ${branch}`);
-
-    if (!year) {
-        return res.status(400).json({ error: 'Year is required in query or body' });
-    }
-    // If branch is 'auto' or undefined, we skip the match check but still process.
-    const isAuto = !branch || branch === 'auto' || branch === 'undefined';
-
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+    const { year, branch } = req.query; const isAuto = !branch || branch === 'auto' || branch === 'undefined';
     try {
-        // Basic validation: Check if '부서' in Excel matches 'branch'
-        const workbook = xlsx.readFile(req.file.path);
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const data = xlsx.utils.sheet_to_json(sheet);
-        
-        let matchFound = false;
-        const deptsInFile = new Set();
-        data.forEach(emp => {
-            let dept = (emp.부서 || '미지정').toString().trim();
-            // Same normalization as in processFile
-            dept = dept.replace(/^\d{4}/, '').replace(/.*평우서비스/, '').trim();
-            deptsInFile.add(dept);
-            if (isAuto || dept === branch) matchFound = true;
-        });
-
-        updateAllData();
-
-        logActivity('UPLOAD', `[${branch}] 지점 ${year}년 자료 업로드: ${decodeText(req.file.originalname)}`);
-        const responseData = { 
-            success: true, 
-            data: processedResults,
-            uploadedFile: decodeText(req.file.originalname),
-            targetBranch: decodeText(branch),
-            matchFound,
-            deptsInFile: Array.from(deptsInFile)
-        };
-        console.log(`Upload successful - Returning: ${responseData.uploadedFile} for ${responseData.targetBranch}`);
-        res.json(responseData);
-    } catch (e) {
-        console.error('Upload processing failed:', e);
-        res.status(500).json({ error: 'Failed to process uploaded file' });
-    }
+        const finalPath = req.file.path; await syncToDB(finalPath); updateAllData();
+        await logActivity('UPLOAD', `[${branch}] ${year}년 업로드: ${decodeText(req.file.originalname)}`);
+        res.json({ success: true, data: processedResults });
+    } catch (e) { res.status(500).json({ error: 'Upload failed' }); }
 });
 
-app.post('/api/rename-branch', (req, res) => {
+app.post('/api/rename-branch', async (req, res) => {
     const { oldName, newName } = req.body;
-    if (!oldName || !newName) return res.status(400).json({ error: 'Old and New names are required' });
-
     try {
         const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
-        let renamedCount = 0;
-
-        scanDirs.forEach(dir => {
-            if (fs.existsSync(dir)) {
-                const oldFile = path.join(dir, `${oldName}_사원등록.xlsx`);
-                const newFile = path.join(dir, `${newName}_사원등록.xlsx`);
-                if (fs.existsSync(oldFile)) {
-                    fs.renameSync(oldFile, newFile);
-                    renamedCount++;
-                }
-            }
-        });
-
-        // Update mapping.json
-        loadMapping();
-        mapping.corporations.forEach(corp => {
-            if (corp.branchNames) {
-                const idx = corp.branchNames.indexOf(oldName);
-                if (idx !== -1) corp.branchNames[idx] = newName;
-            }
-        });
-        saveMapping();
-        updateAllData();
-
-        logActivity('RENAME', `지점명 변경: [${oldName}] -> [${newName}]`);
-        console.log(`Rename branch: [${oldName}] -> [${newName}] (${renamedCount} files renamed)`);
+        for (const dir of scanDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const oldFile = path.join(dir, `${oldName}_사원등록.xlsx`), newFile = path.join(dir, `${newName}_사원등록.xlsx`);
+            if (fs.existsSync(oldFile)) { fs.renameSync(oldFile, newFile); await syncToDB(newFile); await syncToDB(oldFile, true); }
+        }
+        loadMapping(); mapping.corporations.forEach(corp => { if (corp.branchNames) { const idx = corp.branchNames.indexOf(oldName); if (idx !== -1) corp.branchNames[idx] = newName; } });
+        await saveMapping(); updateAllData(); await logActivity('RENAME', `${oldName} -> ${newName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) {
-        console.error('Rename failed:', e);
-        res.status(500).json({ error: 'Failed to rename branch' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Rename failed' }); }
 });
 
-app.post('/api/delete-branch', (req, res) => {
+app.post('/api/delete-branch', async (req, res) => {
     const { branchName } = req.body;
-    if (!branchName) return res.status(400).json({ error: 'Branch name is required' });
-
     try {
-        const backupRoot = path.join(WATCH_DIR, '_초기화_백업');
-        if (!fs.existsSync(backupRoot)) fs.mkdirSync(backupRoot, { recursive: true });
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0];
-        const backupDir = path.join(backupRoot, `deleted_${branchName}_${timestamp}`);
-        fs.mkdirSync(backupDir, { recursive: true });
-
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0], backupDir = path.join(WATCH_DIR, '_초기화_백업', `deleted_${branchName}_${timestamp}`); fs.mkdirSync(backupDir, { recursive: true });
         const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
-        let movedCount = 0;
-
-        scanDirs.forEach(dir => {
-            if (fs.existsSync(dir)) {
-                const branchFile = path.join(dir, `${branchName}_사원등록.xlsx`);
-                if (fs.existsSync(branchFile)) {
-                    const dirName = path.basename(dir);
-                    const newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${branchName}_사원등록.xlsx` : `${branchName}_사원등록.xlsx`;
-                    fs.renameSync(branchFile, path.join(backupDir, newName));
-                    movedCount++;
-                }
-            }
-        });
-
-        // Update mapping.json
-        loadMapping();
-        mapping.corporations.forEach(corp => {
-            if (corp.branchNames) {
-                corp.branchNames = corp.branchNames.filter(bn => bn !== branchName);
-            }
-        });
-        saveMapping();
-        updateAllData();
-
-        logActivity('DELETE', `지점 삭제: [${branchName}]`);
-        console.log(`Delete branch: [${branchName}] (${movedCount} files archived)`);
+        for (const dir of scanDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const branchFile = path.join(dir, `${branchName}_사원등록.xlsx`);
+            if (fs.existsSync(branchFile)) { const newName = `${path.basename(dir)}_${branchName}_사원등록.xlsx`, archPath = path.join(backupDir, newName); fs.renameSync(branchFile, archPath); await syncToDB(archPath); await syncToDB(branchFile, true); }
+        }
+        loadMapping(); mapping.corporations.forEach(corp => { if (corp.branchNames) corp.branchNames = corp.branchNames.filter(bn => bn !== branchName); });
+        await saveMapping(); updateAllData(); await logActivity('DELETE', `지점 삭제: ${branchName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) {
-        console.error('Delete failed:', e);
-        res.status(500).json({ error: 'Failed to delete branch' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Delete failed' }); }
 });
 
-app.post('/api/clear-branch-data', (req, res) => {
+app.post('/api/clear-branch-data', async (req, res) => {
     const { branchName } = req.body;
-    if (!branchName) return res.status(400).json({ error: 'Branch name is required' });
-
     try {
-        const backupRoot = path.join(WATCH_DIR, '_초기화_백업');
-        if (!fs.existsSync(backupRoot)) fs.mkdirSync(backupRoot, { recursive: true });
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0];
-        const backupDir = path.join(backupRoot, `clear_${branchName}_${timestamp}`);
-        fs.mkdirSync(backupDir, { recursive: true });
-
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').split('Z')[0], backupDir = path.join(WATCH_DIR, '_초기화_백업', `clear_${branchName}_${timestamp}`); fs.mkdirSync(backupDir, { recursive: true });
         const scanDirs = [WATCH_DIR, ...SUPPORTED_YEARS.map(yr => path.join(WATCH_DIR, yr.toString()))];
-        let movedCount = 0;
-
-        scanDirs.forEach(dir => {
-            if (fs.existsSync(dir)) {
-                const branchFile = path.join(dir, `${branchName}_사원등록.xlsx`);
-                if (fs.existsSync(branchFile)) {
-                    const dirName = path.basename(dir);
-                    const newName = SUPPORTED_YEARS.includes(parseInt(dirName)) ? `${dirName}_${branchName}_사원등록.xlsx` : `${branchName}_사원등록.xlsx`;
-                    fs.renameSync(branchFile, path.join(backupDir, newName));
-                    movedCount++;
-                }
-            }
-        });
-
-        updateAllData();
-
-        logActivity('CLEAR', `지점 데이터 비우기: [${branchName}]`);
-        console.log(`Clear branch data: [${branchName}] (${movedCount} files archived)`);
+        for (const dir of scanDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const branchFile = path.join(dir, `${branchName}_사원등록.xlsx`);
+            if (fs.existsSync(branchFile)) { const archPath = path.join(backupDir, `${path.basename(dir)}_${branchName}_xlsx`); fs.renameSync(branchFile, archPath); await syncToDB(archPath); await syncToDB(branchFile, true); }
+        }
+        updateAllData(); await logActivity('CLEAR', `지점 비우기: ${branchName}`);
         res.json({ success: true, data: processedResults });
-    } catch (e) {
-        console.error('Clear failed:', e);
-        res.status(500).json({ error: 'Failed to clear branch data' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Clear failed' }); }
 });
 
-app.get('/api/mapping', (req, res) => {
-    loadMapping();
-    res.json(mapping);
-});
+app.get('/api/mapping', (req, res) => { loadMapping(); res.json(mapping); });
+app.post('/api/mapping', async (req, res) => { mapping = req.body; await saveMapping(); updateAllData(); res.json({ success: true, data: processedResults }); });
 
-app.post('/api/mapping', (req, res) => {
-    mapping = req.body;
-    saveMapping();
-    updateAllData();
-    res.json({ success: true, data: processedResults });
-});
-
-// Serve static files from the React app
 const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(clientBuildPath)) {
     app.use(express.static(clientBuildPath));
-    app.get('*', (req, res) => {
-        res.sendFile(path.join(clientBuildPath, 'index.html'));
-    });
+    app.get('*', (req, res) => res.sendFile(path.join(clientBuildPath, 'index.html')));
 }
 
 const server = app.listen(process.env.PORT || PORT, () => {
     console.log(`Server running on port ${process.env.PORT || PORT}`);
-    console.log(`Data directory: ${WATCH_DIR}`);
     updateAllData();
 });
-
-server.on('error', (err) => {
-    console.error('SERVER ERROR:', err);
-});
-
-// Keep-alive handle
-setInterval(() => {
-    // Just keeping the event loop busy
-}, 10000);
+server.on('error', (err) => console.error('SERVER ERROR:', err));
+setInterval(() => {}, 10000);

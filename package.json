@@ -16,6 +16,7 @@
     "chokidar": "^3.6.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "mongoose": "^9.3.0",
     "multer": "^1.4.5-lts.1",
     "xlsx": "^0.18.5"
   }

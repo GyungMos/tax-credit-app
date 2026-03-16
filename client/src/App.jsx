@@ -918,8 +918,8 @@ const App = () => {
                 className="btn-upload" 
                 style={{ 
                   margin: 0, 
-                  opacity: (selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0)) ? 1 : 0.5,
-                  cursor: (selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0)) ? 'pointer' : 'not-allowed'
+                  opacity: 1,
+                  cursor: 'pointer'
                 }}
               >
                 <Upload size={18} /> 자료 업로드
@@ -927,7 +927,7 @@ const App = () => {
                   type="file" 
                   accept=".xlsx" 
                   style={{ display: 'none' }} 
-                  disabled={!(selectedBranch || selectedCorp || (!data.corporations || Object.keys(data.corporations).length === 0))}
+                  disabled={false}
                   onChange={(e) => {
                     const file = e.target.files[0];
                     if (file) handleTargetedUpload(file);
