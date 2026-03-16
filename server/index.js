@@ -304,9 +304,11 @@ function processFile(filePath) {
 }
 
 async function updateAllData() {
+    console.log(`[${new Date().toISOString()}] Data update triggered...`);
     try {
         loadMapping();
         SUPPORTED_YEARS = getAvailableYears();
+        console.log(`Supported Years: ${SUPPORTED_YEARS}`);
         
         // Scan all year-specific folders
         const allProcessed = {};
@@ -466,16 +468,20 @@ async function updateAllData() {
 }
 
 // File Watcher for auto-refresh
-chokidar.watch(WATCH_DIR, { 
-    ignored: /(^|[\/\\])\..|node_modules|_초기화_백업/,
-    persistent: true,
-    ignoreInitial: true 
-}).on('all', (event, filePath) => {
-    if (path.extname(filePath) === '.xlsx' && path.basename(filePath).includes('사원등록')) {
-        console.log(`Watcher: File change detected [${event}] on ${path.basename(filePath)}`);
-        updateAllData();
-    }
-});
+try {
+    chokidar.watch(WATCH_DIR, { 
+        ignored: /(^|[\/\\])\..|node_modules|_초기화_백업/,
+        persistent: true,
+        ignoreInitial: true 
+    }).on('all', (event, filePath) => {
+        if (path.extname(filePath) === '.xlsx' && path.basename(filePath).includes('사원등록')) {
+            console.log(`Watcher: File change detected [${event}] on ${path.basename(filePath)}`);
+            updateAllData();
+        }
+    });
+} catch (e) {
+    console.warn('Watcher could not be initialized (might be non-local or permission issue):', e.message);
+}
 
 app.get('/api/data', (req, res) => {
     res.json(processedResults);
